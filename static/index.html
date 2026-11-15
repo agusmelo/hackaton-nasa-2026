@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SPHEREx Motion Viewer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0e14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%23ff9e3d' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23ff9e3d'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 <!-- vendored: plotly.js-dist-min@2.35.2 and aladin-lite@3.8.2 (jsDelivr) so the app runs without CDN access -->
 <script src="/static/vendor/plotly.min.js"></script>
@@ -16,38 +17,62 @@
 <body>
 <header>
   <div class="brand">
-    <span class="logo">◎</span>
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="11" fill="none" stroke="currentColor" stroke-width="2.4"/>
+      <circle cx="16" cy="16" r="3.4" fill="currentColor"/>
+      <path d="M27 5l-5 5" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-dasharray="1 5"/>
+    </svg>
     <div>
       <h1>SPHEREx Motion Viewer</h1>
       <p class="sub">Blink NASA SPHEREx near-infrared sky images across epochs to find things that move or change.</p>
     </div>
   </div>
-  <form id="search">
-    <input id="q" placeholder="Object name or RA Dec (e.g. 08h55m10.8s -07d14m42s)" autocomplete="off">
-    <label class="fov">FOV
-      <select id="fov">
-        <option value="2.5">2.5′</option>
-        <option value="5" selected>5′</option>
-        <option value="8">8′</option>
-        <option value="12">12′</option>
+  <form id="search" role="search">
+    <div class="searchbar">
+      <select id="kind" aria-label="Kind of target" title="Stars, brown dwarfs and galaxies stay at one sky position. Asteroids and comets move, so the viewer follows them.">
+        <option value="sky">Star / sky position</option>
+        <option value="moving">Asteroid / comet</option>
       </select>
-    </label>
-    <button type="submit">View</button>
+      <input id="q" aria-label="Target" placeholder="Object name or RA Dec (e.g. 08h55m10.8s -07d14m42s)" autocomplete="off">
+      <label class="fov" title="Field of view of the player">Field
+        <select id="fov">
+          <option value="2.5">2.5′</option>
+          <option value="5" selected>5′</option>
+          <option value="8">8′</option>
+          <option value="12">12′</option>
+        </select>
+      </label>
+    </div>
+    <button type="submit" class="go">View</button>
   </form>
-  <div class="presets" id="presets"></div>
+  <div class="presets" id="presets">
+    <div class="pgroup"><span class="plabel">Stars and brown dwarfs</span><div class="chips" id="presets-sky"></div></div>
+    <div class="pgroup"><span class="plabel">Solar system</span><div class="chips" id="presets-moving"></div></div>
+  </div>
 </header>
 
-<div id="status" class="status hidden">
+<div id="status" class="status hidden" role="status" aria-live="polite">
   <div class="stage" id="stage"></div>
   <div class="bar"><div id="barfill"></div></div>
 </div>
 
+<section id="welcome" class="welcome">
+  <h2>See the infrared sky change</h2>
+  <p class="lead">SPHEREx maps the whole sky every six months in 102 colours of infrared light. Compare its passes over the same patch and the things that moved or changed brightness stand out.</p>
+  <ol class="steps">
+    <li><b>Pick a target</b><span>Type a name or coordinates, or choose an asteroid or comet. The examples above load in seconds.</span></li>
+    <li><b>Blink the epochs</b><span>Play the passes as a short film. Difference mode turns anything that moved into a black-and-white pair.</span></li>
+    <li><b>Measure what you find</b><span>Click a source for its spectrum, its light curve and how fast it moves across the sky.</span></li>
+  </ol>
+</section>
+
 <main id="main" class="hidden">
   <section class="viewer">
     <div class="titlebar">
-      <div>
+      <div class="titletext">
         <h2 id="tname"></h2>
-        <div id="tcoords" class="muted mono"></div>
+        <div id="tcoords" class="facts"></div>
+        <p id="tnote" class="hint tnote"></p>
       </div>
       <div class="links">
         <button id="copylink" class="ghost">Copy link</button>
@@ -56,8 +81,7 @@
     </div>
     <div class="canvaswrap">
       <canvas id="view" width="640" height="640"></canvas>
-      <div class="compass">N ↑ &nbsp; E ←</div>
-      <div id="framelabel" class="framelabel mono"></div>
+      <div class="compass" aria-hidden="true">N ↑ &nbsp; E ←</div>
       <div id="hover" class="hoverlabel mono"></div>
       <div class="zoomctl" title="Scroll to zoom, drag to pan, double-click to reset">
         <button id="zoomout" type="button" aria-label="Zoom out">−</button>
@@ -65,10 +89,11 @@
         <button id="zoomin" type="button" aria-label="Zoom in">+</button>
         <button id="zoomreset" type="button" aria-label="Reset zoom">⟲</button>
       </div>
+      <div id="framelabel" class="framelabel mono"></div>
     </div>
     <div class="transport">
-      <button id="play" title="Play/pause (space)">❚❚</button>
-      <input type="range" id="slider" min="0" max="0" value="0">
+      <button id="play" title="Play/pause (space)" aria-label="Play or pause">❚❚</button>
+      <input type="range" id="slider" min="0" max="0" value="0" aria-label="Frame">
       <label>Speed <input type="range" id="speed" min="1" max="12" value="3"></label>
     </div>
 
@@ -95,11 +120,12 @@
         <p class="hint">SPHEREx's filter changes wavelength across each detector, so every exposure sees a target at a different wavelength. Comparing epochs within the same detectors keeps colour changes from looking like variability.</p>
       </fieldset>
       <fieldset>
-        <legend>Overlays</legend>
-        <div class="row">
-          <label><input type="checkbox" id="ov-gaia" checked> Gaia DR3 (at frame epoch)</label>
-          <label><input type="checkbox" id="ov-target" checked> Target prediction</label>
-          <label><input type="checkbox" id="ov-ap" checked> Photometry aperture</label>
+        <legend>Marks on the image</legend>
+        <div class="row marks">
+          <label><input type="checkbox" id="ov-target" checked><span class="swatch cross" style="--c:#ff4fd8"></span> Target prediction</label>
+          <label><input type="checkbox" id="ov-ap" checked><span class="swatch ring" style="--c:#7bd88f"></span> Measurement circle</label>
+          <label class="only-sky"><input type="checkbox" id="ov-gaia" checked><span class="swatch ring" style="--c:#59c2ff"></span> Gaia DR3 stars, at the frame's date</label>
+          <label class="only-sky" title="Names of the objects SIMBAD knows in this field, and of fast-moving stars. Hover any mark for its details."><input type="checkbox" id="ov-names" checked><span class="swatch tag">Aa</span> Names</label>
         </div>
       </fieldset>
     </div>
@@ -107,12 +133,34 @@
 
   <section class="side">
     <div class="card">
-      <h3>Sky context <span class="muted" id="hipssrc">AllWISE colour</span></h3>
+      <div class="skyhead">
+        <h3>Sky context <span class="muted" id="hipssrc">AllWISE colour</span></h3>
+        <button id="skyload" type="button" class="ghost small" disabled title="Load the SPHEREx exposures of the dashed box at the centre of this panel into the player">Load this field</button>
+      </div>
+      <div class="skylayer">
+        <div class="seg" id="skylayer" role="group" aria-label="Sky image">
+          <button type="button" data-v="wise" class="on" title="AllWISE colour image (WISE, 3.4–22 µm)">AllWISE</button>
+          <button type="button" data-v="sx" title="SPHEREx's own all-sky mosaic, one wavelength at a time. It averages every pass, so it shows the sky but not motion">SPHEREx</button>
+        </div>
+        <label class="sxwave hidden" id="sxwave" title="Wavelength of the SPHEREx mosaic (99 of its 102 frames)">
+          <input type="range" id="sxframe" min="0" max="98" value="21" aria-label="SPHEREx wavelength">
+          <span class="sxval"><span class="dot" id="sxdot"></span><span id="sxlabel" class="mono"></span></span>
+        </label>
+      </div>
+      <p class="hint skyhint" id="skyhint">Drag the sky to pick another field</p>
       <div id="aladin"></div>
+      <div id="skygrip" class="skygrip" role="separator" aria-orientation="horizontal" aria-label="Drag to resize the sky panel" title="Drag to resize · full-screen button inside the panel" tabindex="0"></div>
+      <div class="skylegend">
+        <span class="only-sky"><i class="box" style="--c:#ff9e3d"></i>Field loaded</span>
+        <span class="only-sky"><i class="box" style="--c:#7bd88f"></i>Player view when zoomed</span>
+        <span class="only-moving"><i class="track"></i>Path of the object, one colour per visit</span>
+        <span><i class="box dashed" style="--c:#59c2ff"></i>Field to load</span>
+      </div>
     </div>
     <div class="card">
+      <div id="objcard" class="objcard hidden" aria-live="polite"></div>
       <h3>Photometry <span class="muted" id="photwhere"></span></h3>
-      <div class="row small">
+      <div class="row small photctl">
         <label>Aperture
           <select id="aprad"><option value="1.5">1.5 px</option><option value="2" selected>2 px</option><option value="3">3 px</option></select>
         </label>
@@ -121,8 +169,11 @@
         <label><input type="checkbox" id="hideflag"> Hide flagged</label>
         <button id="phot-reset" class="ghost small">Reset to target</button>
       </div>
-      <p class="hint">Click anywhere on the image to measure that source.</p>
-      <div id="spec" class="plot"></div>
+      <p class="hint trackinfo" id="trackinfo">Click a source on the image to measure it.</p>
+      <p class="hint photnote hidden" id="photnote"></p>
+      <h4 class="plothead">Spectrum <span class="muted">one point per exposure · colour = epoch</span></h4>
+      <div id="spec" class="plot plot-spec"></div>
+      <h4 class="plothead">Light curve <span class="muted">colour = wavelength</span></h4>
       <div id="lc" class="plot"></div>
     </div>
   </section>
@@ -131,7 +182,7 @@
     <h3>Exposures <span class="muted" id="nframes"></span></h3>
     <div class="tablewrap">
       <table id="ftable">
-        <thead><tr><th>#</th><th>Date (UTC)</th><th>Epoch</th><th>Det</th><th>λ (µm)</th><th>Flux (mJy)</th><th>Flags near target</th><th>Source</th></tr></thead>
+        <thead><tr><th>#</th><th>Date (UTC)</th><th>Epoch</th><th>Detector</th><th>λ (µm)</th><th>Flux (mJy)</th><th>Flags near target</th><th>Source</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -139,8 +190,10 @@
 </main>
 
 <footer>
-  Data: NASA SPHEREx via <a href="https://irsa.ipac.caltech.edu/Missions/spherex.html" target="_blank" rel="noopener">IRSA</a> ·
-  Gaia DR3 (ESA) · names via CDS Sesame · context via Aladin Lite (CDS). Prototype for the NASA Space Apps 2026 "Planet X and SPHEREx" challenge.
+  <p>Data: NASA SPHEREx via <a href="https://irsa.ipac.caltech.edu/Missions/spherex.html" target="_blank" rel="noopener">IRSA</a> ·
+  solar-system object positions via IRSA's Moving Object Search Tool (JPL Horizons orbits) ·
+  Gaia DR3 (ESA) via STScI/MAST · names and object types via SIMBAD and CDS Sesame · context via Aladin Lite (CDS). Prototype for the NASA Space Apps 2026 "Planet X and SPHEREx" challenge.</p>
+  <p class="ack">This publication makes use of data products from the Spectro-Photometer for the History of the Universe, Epoch of Reionization and Ices Explorer (SPHEREx), which is a joint project of the Jet Propulsion Laboratory and the California Institute of Technology, and is funded by the National Aeronautics and Space Administration.</p>
 </footer>
 <script src="/static/app.js"></script>
 </body>

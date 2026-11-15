@@ -196,12 +196,28 @@ def frame_roll(url: str) -> float | None:
         return None
 
 
-def process_frame(meta: dict, ra0: float, dec0: float, npix: int) -> dict:
-    """Reproject one SPHEREx exposure onto the common grid. Cached on disk."""
-    ck = CACHE / "frames" / f"{_key(meta['url'], round(ra0, 6), round(dec0, 6), npix, 'v3')}.npz"
-    if ck.exists():
+def _frame_cache_path(meta: dict, ra0: float, dec0: float, npix: int) -> Path:
+    return CACHE / "frames" / f"{_key(meta['url'], round(ra0, 6), round(dec0, 6), npix, 'v3')}.npz"
+
+
+def cached_frame(meta: dict, ra0: float, dec0: float, npix: int) -> dict | None:
+    """The processed frame if it is already on disk (no network), else None."""
+    ck = _frame_cache_path(meta, ra0, dec0, npix)
+    if not ck.exists():
+        return None
+    try:
         z = np.load(ck, allow_pickle=False)
         return {"data": z["data"], **json.loads(str(z["meta"]))}
+    except Exception:
+        return None  # unreadable cache file: fall back to reading from IRSA
+
+
+def process_frame(meta: dict, ra0: float, dec0: float, npix: int) -> dict:
+    """Reproject one SPHEREx exposure onto the common grid. Cached on disk."""
+    ck = _frame_cache_path(meta, ra0, dec0, npix)
+    hit = cached_frame(meta, ra0, dec0, npix)
+    if hit is not None:
+        return hit
 
     im = _load_image(meta["url"])
     grid = make_grid(ra0, dec0, npix)
@@ -255,26 +271,184 @@ def encode_f32(a: np.ndarray) -> str:
 
 
 # ---------------------------------------------------------------- Gaia DR3 overlay
+# The same Gaia DR3 table from two archives: STScI/MAST (the one the challenge lists) and ESA's own.
+GAIA_TAP = [
+    ("https://mast.stsci.edu/vo-tap/api/v0.1/gaiadr3/sync", "dbo.gaia_source"),
+    ("https://gea.esac.esa.int/tap-server/tap/sync", "gaiadr3.gaia_source"),
+]
+
+
 def gaia_sources(ra: float, dec: float, radius_deg: float, gmax: float = 19.0) -> list[dict]:
-    ck = CACHE / f"gaia_{_key(round(ra, 4), round(dec, 4), round(radius_deg, 4), gmax)}.json"
+    ck = CACHE / f"gaia_{_key(round(ra, 4), round(dec, 4), round(radius_deg, 4), gmax, 'v2')}.json"
     if ck.exists():
         return json.loads(ck.read_text())
-    q = f"""SELECT TOP 3000 source_id, ra, dec, pmra, pmdec, parallax, phot_g_mean_mag
-FROM gaiadr3.gaia_source
+    lines, last = None, None
+    for url, table in GAIA_TAP:
+        q = f"""SELECT TOP 3000 source_id, ra, dec, pmra, pmdec, parallax, parallax_error, phot_g_mean_mag,
+       bp_rp, teff_gspphot, radial_velocity, phot_variable_flag
+FROM {table}
 WHERE 1=CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {radius_deg}))
   AND phot_g_mean_mag < {gmax}
 ORDER BY phot_g_mean_mag"""
-    r = requests.post("https://gea.esac.esa.int/tap-server/tap/sync",
-                      data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": q},
-                      timeout=90, headers=UA)
-    r.raise_for_status()
-    lines = r.text.strip().splitlines()
-    cols = lines[0].split(",")
+        try:
+            r = requests.get(url, params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": q},
+                             timeout=(8, 60), headers=UA)  # give up quickly on a host that is down
+            if r.ok and r.text.lstrip().startswith("source_id"):
+                lines = r.text.strip().splitlines()
+                break
+            last = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last = type(e).__name__
+    if lines is None:
+        raise IOError(f"no Gaia DR3 archive is answering ({last})")
+    cols = [c.strip() for c in lines[0].split(",")]
     out = []
     for ln in lines[1:]:
-        v = dict(zip(cols, ln.split(",")))
-        f = lambda k: float(v[k]) if v.get(k) not in (None, "", "null") else None
+        v = {c: x.strip() for c, x in zip(cols, ln.split(","))}
+        f = lambda k: float(v[k]) if v.get(k) not in (None, "", "null", "NaN") else None
         out.append({"id": v["source_id"], "ra": f("ra"), "dec": f("dec"), "pmra": f("pmra") or 0.0,
-                    "pmdec": f("pmdec") or 0.0, "plx": f("parallax"), "g": f("phot_g_mean_mag")})
+                    "pmdec": f("pmdec") or 0.0, "plx": f("parallax"), "plx_err": f("parallax_error"),
+                    "g": f("phot_g_mean_mag"), "bp_rp": f("bp_rp"), "teff": f("teff_gspphot"),
+                    "rv": f("radial_velocity"), "variable": v.get("phot_variable_flag", "").strip('"') == "VARIABLE"})
+    ck.write_text(json.dumps(out))
+    return out
+
+
+# ---------------------------------------------------------------- SIMBAD: names and object types
+# SIMBAD is run by CDS; Harvard hosts its official mirror, which is tried first because CDS can be down.
+SIMBAD_TAP = ["https://simbad.cfa.harvard.edu/simbad/sim-tap/sync", "https://simbad.cds.unistra.fr/simbad/sim-tap/sync"]
+
+
+def simbad_objects(ra: float, dec: float, radius_deg: float) -> list[dict]:
+    """Known objects in the field: name, type in words, spectral type, proper motion (positions at
+    J2000) and the Gaia DR3 id when SIMBAD has one, which is how they are matched to the Gaia overlay."""
+    ck = CACHE / f"simbad_{_key(round(ra, 4), round(dec, 4), round(radius_deg, 4))}.json"
+    if ck.exists():
+        return json.loads(ck.read_text())
+    q = (
+        "SELECT TOP 400 b.main_id, b.ra, b.dec, b.pmra, b.pmdec, b.plx_value, b.sp_type, b.otype, o.description, i.id AS gaia "
+        "FROM basic AS b JOIN otypedef AS o ON o.otype = b.otype "
+        "LEFT JOIN ident AS i ON i.oidref = b.oid AND i.id LIKE 'Gaia DR3 %' "
+        f"WHERE CONTAINS(POINT('ICRS', b.ra, b.dec), CIRCLE('ICRS', {ra}, {dec}, {radius_deg})) = 1"
+    )
+    last = None
+    for url in SIMBAD_TAP:
+        try:
+            r = requests.get(url, params={"request": "doQuery", "lang": "adql", "format": "tsv", "query": q},
+                             timeout=40, headers=UA)
+            if r.ok and r.text.startswith("main_id"):
+                break
+            last = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last = str(e)
+    else:
+        raise IOError(f"SIMBAD is not answering ({last})")
+    lines = r.text.strip().splitlines()
+    cols = lines[0].split("\t")
+    out = []
+    for ln in lines[1:]:
+        v = {c: x.strip().strip('"').strip() for c, x in zip(cols, ln.split("\t"))}
+        f = lambda k: float(v[k]) if v.get(k) else None
+        if f("ra") is None or f("dec") is None:
+            continue
+        out.append({"name": re.sub(r"\s+", " ", v["main_id"]), "ra": f("ra"), "dec": f("dec"),
+                    "pmra": f("pmra") or 0.0, "pmdec": f("pmdec") or 0.0, "plx": f("plx_value"),
+                    "sptype": v.get("sp_type") or None, "otype": v.get("otype") or None,
+                    "kind": v.get("description") or None,
+                    "gaia": (v.get("gaia") or "").replace("Gaia DR3 ", "") or None})
+    ck.write_text(json.dumps(out))
+    return out
+
+
+# ---------------------------------------------------------------- solar-system objects (IRSA MOST)
+MOST_URL = "https://irsa.ipac.caltech.edu/cgi-bin/MOST/nph-most"
+SURVEY_START = "2025-04-01"  # just before SPHEREx began its survey
+
+
+def _most_query(params: dict) -> requests.Response:
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(MOST_URL, params={"catalog": "spherex", "output_mode": "Brief",
+                                               "obs_begin": SURVEY_START,
+                                               "obs_end": Time.now().strftime("%Y-%m-%d"), **params},
+                             timeout=240, headers=UA)
+            if r.status_code < 500:
+                return r
+            last = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last = str(e)
+        time.sleep(2 * (attempt + 1))
+    raise IOError(f"IRSA MOST is not answering ({last}); try again shortly")
+
+
+def most_search(name: str) -> dict:
+    """Every SPHEREx exposure that caught a solar-system object, with its predicted position in each.
+
+    Uses IRSA's Moving Object Search Tool, which propagates the JPL Horizons orbit to each exposure time.
+    `name` is an asteroid/comet name or designation ("Vesta", "433 Eros", "3I/ATLAS") or a NAIF id.
+    Returns {"object": resolved name, "orbit": {...}, "frames": [...]} with frames sorted by time.
+    """
+    name = name.strip()
+    ck = CACHE / f"most_{_key(name.lower())}.json"
+    if ck.exists() and time.time() - ck.stat().st_mtime < 7 * 86400:  # MOST takes about a minute per object
+        return json.loads(ck.read_text())
+    if re.fullmatch(r"\d{3,}", name):
+        r = _most_query({"input_type": "naifid_input", "obj_naifid": name})
+    else:
+        # MOST wants the bare Horizons name: "Eros" not "433 Eros", "3I" or "C/2025 N1" not "3I/ATLAS".
+        variants = [name]
+        if m := re.fullmatch(r"\(?\d+\)?\s+(.+)", name):
+            variants.append(m.group(1))
+        if m := re.fullmatch(r"(\d+[IP])/.+", name, re.I):
+            variants.append(m.group(1))
+        for v in variants:
+            r = _most_query({"input_type": "name_input", "obj_name": v})
+            if "|" in r.text or "NAIF ID=" in r.text:
+                break
+        cands = re.findall(r"^\s*(.+?), Object Type=([^,]+), NAIF ID=(\d+), Designation=(\S.*?)\s*$", r.text, re.M)
+        if "|" not in r.text and cands:
+            real = [c for c in cands if c[3] != "NO_VALUE"]
+            if len(real) == 1 or len(cands) == 1:
+                # e.g. "Ceres" matches two Horizons records, only one with a designation
+                r = _most_query({"input_type": "naifid_input", "obj_naifid": (real or cands)[0][2]})
+            else:
+                opts = "; ".join(f"{c[0]} [{c[1]}] = {c[2]}" for c in cands[:8])
+                raise ValueError(f"'{name}' matches several objects. Search again with the NAIF id of the one you want: {opts}")
+    lines = r.text.splitlines()
+    head = next((ln for ln in lines if ln.startswith("|")), None)
+    if head is None:
+        msg = " ".join(re.sub(r"<[^>]+>", " ", r.text).split())[:300]
+        raise ValueError(f"MOST could not find '{name}': {msg or 'no answer'}")
+    info = dict(re.findall(r'^[\\](\w+)\s*=\s*"?\s*([^"\n]*?)\s*"?\s*$', r.text, re.M))
+    cuts = [i for i, ch in enumerate(head) if ch == "|"]
+    cols = [c.strip() for c in head.strip("|").split("|")]
+    seen, frames = set(), []
+    rows = [ln for ln in lines if ln and ln[0] == " " and ".fits" in ln]
+    # prefer the Data Release over Quick Release when the same exposure is in both
+    rows.sort(key=lambda ln: "/dr" not in ln)
+    for ln in rows:
+        v = {c: ln[a + 1:b + 1].strip() for c, (a, b) in zip(cols, zip(cuts[:-1], cuts[1:]))}
+        try:
+            fid = f"{v['observationid']}/{v['productid']}"
+            if fid in seen:
+                continue
+            seen.add(fid)
+            uri = v["uri"]
+            frames.append({
+                "id": fid, "url": "https://irsa.ipac.caltech.edu/" + uri.lstrip("/"),
+                "collection": "spherex_" + uri.split("/")[3] if uri.count("/") > 3 else "spherex",
+                "detector": int(v["productid"][-1]),
+                "mjd": float(v["mjd_start"]), "exptime": float(v["exposure_time"]),
+                "ra_obj": float(v["ra_obj"]), "dec_obj": float(v["dec_obj"]),
+                "vmag": float(v["vmag"]), "sun_dist": float(v["sun_dist"]), "geo_dist": float(v["geo_dist"]),
+                "phase": float(v["phase"]),
+            })
+        except (KeyError, ValueError):
+            continue  # malformed row
+    frames.sort(key=lambda f: f["mjd"])
+    out = {"object": info.get("object_name", name),
+           "orbit": {k: info[k] for k in ("semimajor_axis", "eccentricity", "inclination") if k in info},
+           "frames": frames}
     ck.write_text(json.dumps(out))
     return out

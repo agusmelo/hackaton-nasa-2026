@@ -12,6 +12,7 @@ Layout verified against DR1 files (l2b-v27):
 from __future__ import annotations
 
 import io
+import os
 import random
 import threading
 import time
@@ -40,7 +41,26 @@ def _session() -> requests.Session:
     return s
 
 
+IRSA_PREFIX = "https://irsa.ipac.caltech.edu/ibe/data/spherex/"
+AWS_PREFIX = "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/"
+# "aws" (default): read from NASA's public S3 mirror first, fall back to IRSA. "irsa": IRSA only.
+SOURCE = os.environ.get("SPHEREX_SOURCE", "aws").lower()
+_aws_misses = 0  # consecutive S3 failures; after a few, stop trying it for this process
+
+
 def _get(url: str, rng: str) -> bytes:
+    """Range read. `url` is always the IRSA URL (it is also the cache key); the same object
+    is fetched from the S3 mirror when possible, which is about twice as fast and is not throttled."""
+    global _aws_misses
+    if SOURCE == "aws" and _aws_misses < 8 and url.startswith(IRSA_PREFIX):
+        try:
+            r = _session().get(AWS_PREFIX + url[len(IRSA_PREFIX):], headers={"Range": f"bytes={rng}"}, timeout=30)
+            if r.status_code == 206:
+                _aws_misses = 0
+                return r.content
+        except requests.RequestException:
+            pass
+        _aws_misses += 1  # not mirrored yet, or S3 unreachable: use IRSA for this read
     last = ""
     for attempt in range(6):
         try:
