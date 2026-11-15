@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPHEREx Motion Viewer</title>
+<link rel="stylesheet" href="/static/style.css">
+<!-- vendored: plotly.js-dist-min@2.35.2 and aladin-lite@3.8.2 (jsDelivr) so the app runs without CDN access -->
+<script src="/static/vendor/plotly.min.js"></script>
+<script type="module">
+  import A from "/static/vendor/aladin.js";
+  window.A = A;
+  window.dispatchEvent(new Event("aladin-ready"));
+</script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">◎</span>
+    <div>
+      <h1>SPHEREx Motion Viewer</h1>
+      <p class="sub">Blink NASA SPHEREx near-infrared sky images across epochs to find things that move or change.</p>
+    </div>
+  </div>
+  <form id="search">
+    <input id="q" placeholder="Object name or RA Dec (e.g. 08h55m10.8s -07d14m42s)" autocomplete="off">
+    <label class="fov">FOV
+      <select id="fov">
+        <option value="2.5">2.5′</option>
+        <option value="5" selected>5′</option>
+        <option value="8">8′</option>
+        <option value="12">12′</option>
+      </select>
+    </label>
+    <button type="submit">View</button>
+  </form>
+  <div class="presets" id="presets"></div>
+</header>
+
+<div id="status" class="status hidden">
+  <div class="stage" id="stage"></div>
+  <div class="bar"><div id="barfill"></div></div>
+</div>
+
+<main id="main" class="hidden">
+  <section class="viewer">
+    <div class="titlebar">
+      <div>
+        <h2 id="tname"></h2>
+        <div id="tcoords" class="muted mono"></div>
+      </div>
+      <div class="links">
+        <button id="copylink" class="ghost">Copy link</button>
+        <button id="copyembed" class="ghost">Embed</button>
+      </div>
+    </div>
+    <div class="canvaswrap">
+      <canvas id="view" width="640" height="640"></canvas>
+      <div class="compass">N ↑ &nbsp; E ←</div>
+      <div id="framelabel" class="framelabel mono"></div>
+      <div id="hover" class="hoverlabel mono"></div>
+      <div class="zoomctl" title="Scroll to zoom, drag to pan, double-click to reset">
+        <button id="zoomout" type="button" aria-label="Zoom out">−</button>
+        <span id="zoomlabel" class="mono">1.0×</span>
+        <button id="zoomin" type="button" aria-label="Zoom in">+</button>
+        <button id="zoomreset" type="button" aria-label="Reset zoom">⟲</button>
+      </div>
+    </div>
+    <div class="transport">
+      <button id="play" title="Play/pause (space)">❚❚</button>
+      <input type="range" id="slider" min="0" max="0" value="0">
+      <label>Speed <input type="range" id="speed" min="1" max="12" value="3"></label>
+    </div>
+
+    <div class="controls">
+      <fieldset>
+        <legend>Display</legend>
+        <div class="seg" id="mode">
+          <button data-v="epoch" class="on" title="Median-stack all selected exposures per epoch, then blink between epochs">Epoch blink</button>
+          <button data-v="rgb" title="Colour image per epoch: blue = 0.75–1.6 µm, green = 1.6–3.8 µm, red = 3.8–5 µm. Cold objects such as brown dwarfs look red">Colour</button>
+          <button data-v="diff" title="Each epoch minus the median of the other epochs: movers show as black/white pairs">Difference</button>
+          <button data-v="exp" title="Every exposure in time order (each at its own wavelength)">Exposures</button>
+        </div>
+        <div class="row">
+          <label>Stretch
+            <select id="stretch"><option value="asinh">asinh</option><option value="linear">linear</option><option value="log">log</option></select>
+          </label>
+          <label>Contrast <input type="range" id="contrast" min="80" max="99.9" step="0.1" value="99.5"></label>
+          <label><input type="checkbox" id="invert"> Invert</label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Detectors (wavelength)</legend>
+        <div class="dets" id="dets"></div>
+        <p class="hint">SPHEREx's filter changes wavelength across each detector, so every exposure sees a target at a different wavelength. Comparing epochs within the same detectors keeps colour changes from looking like variability.</p>
+      </fieldset>
+      <fieldset>
+        <legend>Overlays</legend>
+        <div class="row">
+          <label><input type="checkbox" id="ov-gaia" checked> Gaia DR3 (at frame epoch)</label>
+          <label><input type="checkbox" id="ov-target" checked> Target prediction</label>
+          <label><input type="checkbox" id="ov-ap" checked> Photometry aperture</label>
+        </div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section class="side">
+    <div class="card">
+      <h3>Sky context <span class="muted" id="hipssrc">AllWISE colour</span></h3>
+      <div id="aladin"></div>
+    </div>
+    <div class="card">
+      <h3>Photometry <span class="muted" id="photwhere"></span></h3>
+      <div class="row small">
+        <label>Aperture
+          <select id="aprad"><option value="1.5">1.5 px</option><option value="2" selected>2 px</option><option value="3">3 px</option></select>
+        </label>
+        <label title="Re-centre on the brightest pixel within 2 px in each epoch. Off by default: for targets with known proper motion the prediction is better, and a brighter neighbour can capture the centroid."><input type="checkbox" id="track"> Follow centroid</label>
+        <label title="When the core is saturated, measure the unsaturated PSF wings instead (relative brightness, good for light curves)"><input type="checkbox" id="wings" checked> Wings if saturated</label>
+        <label><input type="checkbox" id="hideflag"> Hide flagged</label>
+        <button id="phot-reset" class="ghost small">Reset to target</button>
+      </div>
+      <p class="hint">Click anywhere on the image to measure that source.</p>
+      <div id="spec" class="plot"></div>
+      <div id="lc" class="plot"></div>
+    </div>
+  </section>
+
+  <section class="tablecard card">
+    <h3>Exposures <span class="muted" id="nframes"></span></h3>
+    <div class="tablewrap">
+      <table id="ftable">
+        <thead><tr><th>#</th><th>Date (UTC)</th><th>Epoch</th><th>Det</th><th>λ (µm)</th><th>Flux (mJy)</th><th>Flags near target</th><th>Source</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Data: NASA SPHEREx via <a href="https://irsa.ipac.caltech.edu/Missions/spherex.html" target="_blank" rel="noopener">IRSA</a> ·
+  Gaia DR3 (ESA) · names via CDS Sesame · context via Aladin Lite (CDS). Prototype for the NASA Space Apps 2026 "Planet X and SPHEREx" challenge.
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

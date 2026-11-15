@@ -1,0 +1,9 @@
+# downloaded SPHEREx data (rebuilt on demand, ~120 MB)
+cache/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# logs
+*.log
