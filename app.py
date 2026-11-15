@@ -95,11 +95,12 @@ def _run_job(job: dict, ra: float | None, dec: float | None, fov: float, pmra: f
             else:
                 ra_c, dec_c = ra, dec
             job["stage"] = "Searching IRSA for SPHEREx images"
-            metas = sx.search_images(ra_c, dec_c)
+            found = sx.search_images_ex(ra_c, dec_c)
+            metas = found["frames"]
             if not metas:
                 raise ValueError("No SPHEREx images cover this position yet")
             centre_of = lambda m: (ra_c, dec_c)
-            extra = {"moving": False}
+            extra = {"moving": False, "notice": found["notice"]}  # e.g. IRSA down, saved image list in use
             gaia_fut = AUX.submit(sx.gaia_sources, ra_c, dec_c, fov / 60 * 0.75 + 0.01)
         epochs = sx.group_epochs(metas)
         # Everything the client needs to start drawing; frames then stream in as they are read.
@@ -107,7 +108,7 @@ def _run_job(job: dict, ra: float | None, dec: float | None, fov: float, pmra: f
             "center": {"ra": ra_c, "dec": dec_c, "epoch": REF_EPOCH},
             "input": {"ra": ra, "dec": dec, "pmra": pmra, "pmdec": pmdec, "epoch": epoch},
             "npix": npix, "scale": sx.PIXSCALE, "fov_arcmin": fov,
-            "epochs": epochs, "collections": sx.COLLECTIONS, "total": len(metas), **extra,
+            "epochs": epochs, "collections": sx.collections(), "total": len(metas), **extra,
         }
         job.update(stage="Reading SPHEREx exposures", total=len(metas), done=0)
         # Frames already on disk are delivered straight away, without queueing behind another
@@ -166,6 +167,21 @@ def api_job(ra: float | None = None, dec: float | None = None, fov: float = Quer
     for k in [k for k, v in JOBS.items() if time.time() - v["created"] > 3600]:
         JOBS.pop(k, None)
     return {"id": jid}
+
+
+@app.get("/api/releases")
+def api_releases():
+    """The SPHEREx data releases this server searches, and how it found them."""
+    return sx.releases()
+
+
+@app.get("/api/wise")
+def api_wise(ra: float, dec: float, radius: float = Query(0.08, gt=0, le=0.3)):
+    """WISE (CatWISE2020) sources around a position, for the overlay."""
+    try:
+        return {"objects": sx.wise_sources(ra, dec, radius)}
+    except Exception as e:
+        raise HTTPException(502, str(e))
 
 
 @app.get("/api/simbad")

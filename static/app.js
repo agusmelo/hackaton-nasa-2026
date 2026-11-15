@@ -154,6 +154,10 @@ function start(meta) {
     api(`/api/simbad?ra=${meta.center.ra}&dec=${meta.center.dec}&radius=${(meta.fov_arcmin / 60 * 0.75 + 0.01).toFixed(4)}`)
       .then((d) => { if (S.data !== myData) return; S.data.simbad = d.objects; buildObjects(); refreshMeasurements(); render(); })
       .catch(() => { });
+    // WISE sources (CatWISE2020): infrared magnitudes for the card, and the "WISE" layer
+    api(`/api/wise?ra=${meta.center.ra}&dec=${meta.center.dec}&radius=${(meta.fov_arcmin / 60 * 0.75 + 0.01).toFixed(4)}`)
+      .then((d) => { if (S.data !== myData) return; S.data.wise = d.objects; buildObjects(); refreshMeasurements(); render(); })
+      .catch(() => { });
   }
   S.idx = 0;
   resetZoom();
@@ -202,7 +206,7 @@ function updateTitle() {
     ["Exposures", `${S.frames.length}${loading}`],
     ["Epochs", data.epochs.length],
     S.failed && ["Unread", `${S.failed} (reload to retry)`, "warn"],
-  ], "");
+  ], data.notice || "");  // set when IRSA's search failed and a saved image list is in use
 }
 
 // Facts about the loaded target as labelled chips under its name (values are built here, never from page input).
@@ -219,6 +223,7 @@ function setFacts(items, note) {
     box.appendChild(chip);
   }
   $("#tnote").textContent = note;
+  $("#tnote").classList.toggle("warn", !!S.data.notice && note === S.data.notice);
 }
 
 // ------------------------------------------------------------------ sequence building
@@ -260,10 +265,32 @@ function rgbStacks() {
   return out;
 }
 
+// Add epochs together: the exposure-weighted mean of the per-epoch stacks. Each epoch stack is already a
+// median (so cosmic rays and passing stars are gone); averaging them over time then deepens the image.
+function addEpochs(stacks) {
+  if (!stacks.length) return null;
+  const len = stacks[0].arr.length, sum = new Float32Array(len), wsum = new Float32Array(len);
+  for (const s of stacks) for (let p = 0; p < len; p++) { const v = s.arr[p]; if (v === v) { sum[p] += v * s.n; wsum[p] += s.n; } }
+  const arr = new Float32Array(len);
+  for (let p = 0; p < len; p++) arr[p] = wsum[p] ? sum[p] / wsum[p] : NaN;
+  const mid = stacks[stacks.length >> 1];  // marks are drawn for the middle epoch
+  return { arr, epoch: mid.epoch, decyear: mid.decyear, n: stacks.reduce((a, s) => a + s.n, 0), k: stacks.length };
+}
+
 function rebuild() {
   const stacks = epochStacks(S.dets);
   if (S.mode === "epoch") S.seq = stacks;
   else if (S.mode === "rgb") S.seq = rgbStacks();
+  else if (S.mode === "sum") {
+    const a = addEpochs(stacks);
+    S.seq = a ? [{ ...a, label: `All ${a.k} epochs added · ${a.n} exposures · D${[...S.dets].sort().join(", D")}` }] : [];
+  } else if (S.mode === "bands") {
+    // one deep image per detector, played from the shortest to the longest wavelength
+    S.seq = [...S.dets].sort().map((d) => {
+      const a = addEpochs(epochStacks(new Set([d])));
+      return a && { ...a, label: `D${d} · ${DET_BANDS[d][0].toFixed(2)}–${DET_BANDS[d][1].toFixed(2)} µm · all epochs added · ${a.n} exposures` };
+    }).filter(Boolean);
+  }
   else if (S.mode === "diff") {
     S.seq = stacks.map((s, i) => {
       const rest = stacks.filter((_, j) => j !== i);
@@ -323,6 +350,8 @@ function computeLimits() {
   } else {
     const s = sampleOf(S.seq.map((it) => it.arr));
     S.lim = [percentile(s, 2), percentile(s, c)];
+    // each detector has its own brightness level, so in Bands every image gets its own stretch
+    for (const it of S.seq) { const v = S.mode === "bands" ? sampleOf([it.arr]) : null; it.lim = v ? [percentile(v, 2), percentile(v, c)] : null; }
   }
 }
 
@@ -382,7 +411,7 @@ function render() {
       d[4 * p + 3] = 255;
     }
   } else {
-    const [lo, hi] = S.lim;
+    const [lo, hi] = it.lim || S.lim;
     for (let p = 0; p < n * n; p++) {
       const v = it.arr[p];
       if (v !== v) { d[4 * p] = 16; d[4 * p + 1] = 18; d[4 * p + 2] = 40; }
@@ -420,20 +449,23 @@ function drawOverlays(it) {
     };
     let named = 0;
     for (const o of S.objects || []) {
+      if (!objShown(o)) continue;
       const [c, r] = objPix(o, it.decyear);
       if (c < -2 || r < -2 || c > n + 1 || r > n + 1) continue;
-      const [x, y] = P(c, r), fast = objPm(o) > 0.3, hov = o === S.hoverObj;
-      const rad = o.src === "gaia" ? Math.max(3, (20 - Math.min(19, o.g || 19)) * 0.9 + 3) : 5;
-      const color = o.src === "simbad" ? "#ffd866" : fast ? "#ff9e3d" : "#59c2ff";
-      if (showStars || hov) {
-        ctx.globalAlpha = hov ? 1 : o.src === "simbad" || fast ? 0.95 : 0.55;
+      const [x, y] = P(c, r), fast = objPm(o) > 0.3, hov = o === S.hoverObj, wise = o.src === "wise";
+      const rad = o.src === "gaia" ? Math.max(3, (20 - Math.min(19, o.g || 19)) * 0.9 + 3) : wise ? (wiseRed(o) ? 6 : 4) : 5;
+      const color = wise ? (wiseRed(o) ? "#ff4d6d" : "#ff7ab8") : o.src === "simbad" ? "#ffd866" : fast ? "#ff9e3d" : "#59c2ff";
+      if (wise || showStars || hov) {
+        ctx.globalAlpha = hov ? 1 : o.src === "simbad" || fast || (wise && wiseRed(o)) ? 0.95 : wise ? 0.7 : 0.55;
         ctx.strokeStyle = color; ctx.lineWidth = hov ? 2.5 : 1.5;
         ctx.beginPath();
-        if (o.src === "simbad") ctx.rect(x - rad, y - rad, 2 * rad, 2 * rad); else ctx.arc(x, y, rad, 0, 2 * Math.PI);
+        if (wise) { ctx.moveTo(x, y - rad); ctx.lineTo(x + rad, y); ctx.lineTo(x, y + rad); ctx.lineTo(x - rad, y); ctx.closePath(); }  // diamond
+        else if (o.src === "simbad") ctx.rect(x - rad, y - rad, 2 * rad, 2 * rad);
+        else ctx.arc(x, y, rad, 0, 2 * Math.PI);
         ctx.stroke(); ctx.globalAlpha = 1; ctx.lineWidth = 1.5;
       }
       if (hov) {
-        const facts = [o.g != null && `G ${o.g.toFixed(1)}`, objPm(o) > 0.02 && `${objPm(o).toFixed(2)}″/yr`, o.kind].filter(Boolean).join(" · ");
+        const facts = [o.g != null && `G ${o.g.toFixed(1)}`, o.w2 != null && `W2 ${o.w2.toFixed(1)}`, objPm(o) > 0.02 && `${objPm(o).toFixed(2)}″/yr`, wise ? (wiseRed(o) ? "red in WISE, not in Gaia" : "WISE, not in Gaia") : o.kind].filter(Boolean).join(" · ");
         tag(x + rad + 6, y, facts ? [objName(o), facts] : [objName(o)], color);
       } else if (showNames && objNotable(o) && named < 14) {
         named++;
@@ -510,18 +542,43 @@ function buildObjects() {
     else objs.push({ src: "simbad", id: s.gaia, ra: s.ra, dec: s.dec, pmra: s.pmra, pmdec: s.pmdec, epoch: 2000.0, g: null,
                      plx: s.plx, plxErr: null, bpRp: null, teff: null, rv: null, variable: false, name, kind: s.kind, sptype: s.sptype });
   }
+  // WISE (CatWISE2020): infrared brightness for the objects above, and sources of its own that Gaia
+  // and SIMBAD do not have. Matched on the sky at the WISE source's own date, within one SPHEREx pixel.
+  const cosd = Math.cos((S.data.center.dec || 0) * d2r);
+  for (const w of S.data.wise || []) {
+    if (w.w1 == null && w.w2 == null) continue;
+    let hit = null, bd = S.data.scale / 3600;
+    for (const o of objs) {
+      if (o.src === "wise") continue;
+      const [ra, dec] = propagate(o.ra, o.dec, o.pmra, o.pmdec, o.epoch, w.epoch);
+      const d = Math.hypot((ra - w.ra) * cosd, dec - w.dec);
+      if (d < bd) { bd = d; hit = o; }
+    }
+    if (hit) { hit.w1 = w.w1; hit.w2 = w.w2; hit.wiseId = w.id; continue; }
+    if (!((w.w1 ?? 99) < 17 || (w.w2 ?? 99) < 16)) continue;  // fainter ones are mostly noise at SPHEREx depth
+    // CatWISE motions are only trustworthy for bright sources
+    const solid = (w.w1 ?? 99) < 15 || (w.w2 ?? 99) < 14.5;
+    objs.push({ src: "wise", id: null, wiseId: w.id, ra: w.ra, dec: w.dec, pmra: solid ? w.pmra : 0, pmdec: solid ? w.pmdec : 0, epoch: w.epoch,
+                g: null, plx: null, plxErr: null, bpRp: null, teff: null, rv: null, variable: false, w1: w.w1, w2: w.w2,
+                name: null, kind: "Infrared source seen by WISE, not in Gaia", sptype: null });
+  }
   S.objects = objs;
 }
 const objPm = (o) => Math.hypot(o.pmra || 0, o.pmdec || 0) / 1000;  // arcsec / yr
-const objName = (o) => o.name || (o.id ? `Gaia DR3 ${o.id}` : o.kind || "Unnamed source");
-const objShort = (o) => o.name || (o.id ? `Gaia …${o.id.slice(-5)}` : o.kind || "source");
+const objName = (o) => o.name || (o.id ? `Gaia DR3 ${o.id}` : o.wiseId ? `CatWISE ${o.wiseId}` : o.kind || "Unnamed source");
+const objShort = (o) => o.name || (o.id ? `Gaia …${o.id.slice(-5)}` : o.wiseId ? `WISE ${o.wiseId.slice(0, 7)}…` : o.kind || "source");
 function objPix(o, year) { return skyToPix(...propagate(o.ra, o.dec, o.pmra, o.pmdec, o.epoch, year)); }
-// worth a permanent label: it has a real name, or it moves fast
-const objNotable = (o) => !!o.name || objPm(o) > 0.3;
+// red in WISE and bright enough to trust: the colour of a cool brown dwarf (or a dusty galaxy)
+const wiseRed = (o) => o.w1 != null && o.w2 != null && o.w1 - o.w2 > 0.8 && o.w2 < 15.5;
+// worth a permanent label: it has a real name, it moves fast, or it is a red WISE source Gaia cannot see
+const objNotable = (o) => !!o.name || objPm(o) > 0.3 || (o.src === "wise" && wiseRed(o));
+// WISE-only sources are drawn, and can be picked, only while their layer is switched on
+const objShown = (o) => o.src !== "wise" || $("#ov-wise").checked;
 
 function nearestObject(col, row, year, maxPx = 1.5) {
   let best = null, bd = maxPx;
   for (const o of S.objects || []) {
+    if (!objShown(o)) continue;
     const [c, r] = objPix(o, year);
     const d = Math.hypot(c - col, r - row);
     if (d < bd) { bd = d; best = o; }
@@ -647,6 +704,11 @@ function renderObjCard() {
     if (o.g != null) rows.push(["Brightness", `G = ${o.g.toFixed(2)} mag`]);
     if (o.bpRp != null) rows.push(["Colour", `BP−RP = ${o.bpRp.toFixed(2)} (${colourWord(o.bpRp)})`]);
     if (o.teff != null) rows.push(["Temperature", `≈ ${Math.round(o.teff / 10) * 10} K`]);
+    if (o.w1 != null || o.w2 != null) {
+      const col = o.w1 != null && o.w2 != null ? o.w1 - o.w2 : null;
+      rows.push(["WISE infrared", [o.w1 != null && `W1 = ${o.w1.toFixed(2)}`, o.w2 != null && `W2 = ${o.w2.toFixed(2)}`,
+        col != null && `W1−W2 = ${col.toFixed(2)} (${col < 0.3 ? "star-like" : col < 0.8 ? "red" : "very red: cool dwarf or dusty galaxy"})`].filter(Boolean).join(" · ")]);
+    }
     // a distance only when the parallax is well measured
     if (o.plx > 0 && (o.plxErr ? o.plx / o.plxErr > 5 : o.plx > 2)) {
       const pc = 1000 / o.plx;
@@ -716,8 +778,8 @@ function trackText() {
   const p = S.phot;
   if (S.data.moving) return "Click anywhere on the image to measure at that offset from the object.";
   if (p.mode === "target") return "Click a source to measure it: the circle follows Gaia stars, or the motion measured in the images.";
-  if (p.source === "gaia" || p.source === "simbad") {
-    const pm = Math.hypot(p.pmra, p.pmdec) / 1000, cat = p.source === "gaia" ? "Gaia's" : "SIMBAD's";
+  if (p.source === "gaia" || p.source === "simbad" || p.source === "wise") {
+    const pm = Math.hypot(p.pmra, p.pmdec) / 1000, cat = { gaia: "Gaia's", simbad: "SIMBAD's", wise: "CatWISE's" }[p.source];
     return pm > 0.005
       ? `The circle follows ${objShort(p.obj)} with ${cat} proper motion: ${pm.toFixed(pm < 1 ? 3 : 2)}″/yr${pm > 0.05 ? " toward the " + compass(p.pmra, p.pmdec) : ""}.`
       : `The circle stays on ${objShort(p.obj)}: the catalogue gives it no measurable motion.`;
@@ -915,7 +977,15 @@ function highlightRow(f) {
   document.querySelectorAll("#ftable tr.cur").forEach((r) => r.classList.remove("cur"));
   if (!f) return;
   const r = document.querySelector(`#ftable tr[data-i="${S.frames.indexOf(f)}"]`);
-  if (r) { r.classList.add("cur"); if (!S.playing) r.scrollIntoView({ block: "nearest" }); }
+  if (r) {
+    r.classList.add("cur");
+    if (!S.playing) {
+      // keep the row in view by scrolling the table only; scrollIntoView would also move the whole page
+      const wrap = r.closest(".tablewrap"), top = r.offsetTop, head = 30;
+      if (top < wrap.scrollTop + head) wrap.scrollTop = top - head;
+      else if (top + r.offsetHeight > wrap.scrollTop + wrap.clientHeight) wrap.scrollTop = top + r.offsetHeight - wrap.clientHeight;
+    }
+  }
 }
 function jumpToFrame(f) {
   if (!S.dets.has(f.detector)) { S.dets.add(f.detector); syncDets(); }
@@ -1036,7 +1106,9 @@ function setupAladin() {
       // The panel is for looking around only: drag, zoom, full screen. Aladin's own menus (layers,
       // settings, grid, coordinate frame, context menu, catalogue and drawing tools) stay off; the
       // image is chosen with this page's AllWISE / SPHEREx switch instead.
-      aladin = A.aladin("#aladin", { survey, fov: (S.fov / 60) * 3, target: `${ra} ${dec}`,
+      // Stereographic projection: the sky as seen from inside the sphere, the way a planetarium shows it.
+      // Aladin's default (orthographic, "SIN") draws a wide field as a globe seen from outside.
+      aladin = A.aladin("#aladin", { survey, fov: (S.fov / 60) * 3, target: `${ra} ${dec}`, projection: "STG",
         showZoomControl: true, showFullscreenControl: true, realFullscreen: false, showFov: true, showReticle: true,
         showLayersControl: false, showSettingsControl: false, showCooGridControl: false, showFrame: false,
         showCooLocation: false, showStatusBar: false, showContextMenu: false, showGotoControl: false,
@@ -1051,6 +1123,15 @@ function setupAladin() {
           if (type === "contextmenu") e.preventDefault();
         }, true);
       }
+      // The wheel only widens or narrows the field of view, about the centre of the panel, and never
+      // past SKY_FOV_MAX: beyond that the stereographic view folds the whole sphere into the panel and
+      // it stops looking like the sky seen from inside. (Aladin's own wheel zoom goes out to 360 deg.)
+      $("#aladin").addEventListener("wheel", (e) => {
+        e.preventDefault(); e.stopPropagation();
+        const f = Math.min(1.35, Math.max(0.74, Math.exp(e.deltaY * 0.0016)));
+        setSkyFov(skyFov() * f);
+      }, { capture: true, passive: false });
+      aladin.on("zoomChanged", clampSkyFov);  // its + / − buttons and pinch gestures obey the same limits
       aladinOverlay = A.graphicOverlay({ color: "#ff9e3d", lineWidth: 2 });
       aladin.addOverlay(aladinOverlay);
       // full-screen is a fixed overlay over the page: stop the page scrolling behind it
@@ -1064,11 +1145,10 @@ function setupAladin() {
       aladin.addOverlay(skyViewOverlay);
       ignoreSkyUntil = performance.now() + 800;
       aladin.on("positionChanged", onSkyMoved);
-      aladin.on("zoomChanged", syncSkyPick);
       new ResizeObserver(syncSkyPick).observe($("#aladin"));
       if (skyLayer === "sx") setSkyLayer("sx");  // chosen before the panel existed (e.g. from the URL)
     } else {
-      if (!S.keepSkyView) { ignoreSkyUntil = performance.now() + 800; aladin.gotoRaDec(ra, dec); aladin.setFoV((S.fov / 60) * 3); }
+      if (!S.keepSkyView) { ignoreSkyUntil = performance.now() + 800; aladin.gotoRaDec(ra, dec); setSkyFov((S.fov / 60) * 3); }
       aladinOverlay.removeAll();
     }
     S.keepSkyView = false;
@@ -1080,6 +1160,31 @@ function setupAladin() {
 // Keep the picker box and the "Load this field" button in step with where the sky panel is looking.
 // The solid orange outline is the field already loaded; the dashed box is the field under the view centre.
 let skyBox = null, skyViewOverlay = null, lastViewKey = "", ignoreSkyUntil = 0;
+
+// ---- field of view of the sky panel, kept between a close-up and a wide "inside the sphere" view
+const SKY_FOV_MIN = 0.03, SKY_FOV_MAX = 140;  // degrees across the panel
+let skyFovSet = null;
+// Aladin's getFov() is unreliable at the extremes, so remember what was last asked for.
+function skyFov() {
+  let f = NaN;
+  try { f = aladin.getFov()[0]; } catch (_) { /* not ready */ }
+  if (skyFovSet != null && !(Math.abs(f - skyFovSet) / skyFovSet < 0.5)) f = skyFovSet;
+  return f > 0 ? f : 1;
+}
+function setSkyFov(deg) {
+  if (!aladin) return;
+  skyFovSet = Math.min(SKY_FOV_MAX, Math.max(SKY_FOV_MIN, deg));
+  ignoreSkyUntil = Math.max(ignoreSkyUntil, performance.now() + 300);  // a zoom is not a pan: do not move the player
+  aladin.setFoV(skyFovSet);
+}
+function clampSkyFov() {
+  let f;
+  try { f = aladin.getFov()[0]; } catch (_) { return; }
+  if (f > SKY_FOV_MAX * 1.02) setSkyFov(SKY_FOV_MAX);
+  else if (f < SKY_FOV_MIN * 0.98) setSkyFov(SKY_FOV_MIN);
+  else skyFovSet = f;
+  syncSkyPick();
+}
 
 // Player -> sky panel: outline what the player is showing. Runs on every render, so it only
 // touches Aladin when the visible window actually changed.
@@ -1121,7 +1226,8 @@ function syncSkyPick() {
   // worth loading once the view centre has left the middle of the loaded field (always, when following a moving object)
   const moved = S.data.moving || offArcmin > 0.15 * S.data.fov_arcmin;
   S.skyPick = { ra, dec };
-  skyBox.style.display = moved ? "block" : "none";
+  // following a solar-system object the panel is usually zoomed far out: a speck of a box would only be clutter
+  skyBox.style.display = moved && !(S.data.moving && side < 14) ? "block" : "none";
   skyBox.style.width = skyBox.style.height = `${Math.max(6, side)}px`;
   btn.disabled = !moved;
   $("#skyhint").textContent = moved
@@ -1136,25 +1242,106 @@ function loadSkyPick() {
   load(q, +$("#fov").value, { ra, dec, keepSkyView: true });
 }
 
-// Solar-system object: draw where it was in each SPHEREx visit and frame the whole path.
+// Solar-system object: frame its whole path in the sky panel. The path itself is drawn by
+// paintSkyTrack() on a canvas of our own, laid over Aladin, so its look is under our control.
 function drawSkyTrack() {
   if (!aladin || !aladinOverlay || !S.data?.moving || !S.frames.length) return;
-  aladinOverlay.removeAll();
+  aladinOverlay.removeAll();  // only this object's path: nothing left over from a previous target
+  if (skyViewOverlay) skyViewOverlay.removeAll();
   const sep = (a, b) => Math.hypot((a.ra_obj - b.ra_obj) * Math.cos(a.dec_obj * d2r), a.dec_obj - b.dec_obj);
-  let far = 0;
   const mid = S.frames[S.frames.length >> 1];
-  S.data.epochs.forEach((_, ei) => {
-    const fs = S.frames.filter((f) => f.epoch === ei);
-    if (!fs.length) return;
-    for (const f of fs) far = Math.max(far, sep(f, mid));
-    try {
-      if (fs.length > 1) aladinOverlay.add(A.polyline(fs.map((f) => [f.ra_obj, f.dec_obj]), { color: EPOCH_COLORS[ei % 8], lineWidth: 3 }));
-      aladinOverlay.add(A.circle(fs[0].ra_obj, fs[0].dec_obj, Math.max(0.01, far / 60), { color: EPOCH_COLORS[ei % 8] }));
-    } catch (_) { /* overlay shapes are a nicety */ }
-  });
+  let far = 0;
+  for (const f of S.frames) far = Math.max(far, sep(f, mid));
+  S.trackVisits = null;  // rebuilt from the frames on the next paint
   ignoreSkyUntil = performance.now() + 800;
   aladin.gotoRaDec(mid.ra_obj, mid.dec_obj);
-  aladin.setFoV(Math.min(170, Math.max(0.5, far * 2.4)));
+  setSkyFov(Math.max(0.5, far * 2.4));  // capped at SKY_FOV_MAX; a longer path is reached by dragging
+}
+
+// The object's positions, one list per SPHEREx visit (exposures of one pointing share a position).
+function trackVisits() {
+  if (S.trackVisits && S.trackVisits.n === S.frames.length) return S.trackVisits.list;
+  const list = [];
+  S.data.epochs.forEach((e, ei) => {
+    const seen = new Set(), pts = [];
+    for (const f of S.frames) {
+      if (f.epoch !== ei) continue;
+      const k = f.mjd.toFixed(4);
+      if (!seen.has(k)) { seen.add(k); pts.push(f); }
+    }
+    if (!pts.length) return;
+    const d = new Date((e.mjd - 40587) * 86400000);  // MJD -> date
+    list.push({ epoch: ei, pts, label: d.toLocaleDateString("en", { month: "short", year: "numeric", timeZone: "UTC" }) });
+  });
+  S.trackVisits = { n: S.frames.length, list };
+  return list;
+}
+
+// Where the object is in the frame the player is showing.
+function trackNow() {
+  const it = S.seq[S.idx];
+  if (!it) return null;
+  if (it.frame) return it.frame;
+  const fs = S.frames.filter((f) => f.epoch === it.epoch);
+  return fs.length ? fs[fs.length >> 1] : null;
+}
+
+let trackCanvas = null;
+function paintSkyTrack() {
+  requestAnimationFrame(paintSkyTrack);  // follows Aladin's own pan/zoom animation frame by frame
+  const box = $("#aladin");
+  const show = !!(aladin && S.data?.moving && S.frames.length && box);
+  if (!show) { if (trackCanvas) trackCanvas.style.display = "none"; return; }
+  if (!trackCanvas) { trackCanvas = document.createElement("canvas"); trackCanvas.id = "skytrack"; box.appendChild(trackCanvas); }
+  trackCanvas.style.display = "block";
+  const dpr = window.devicePixelRatio || 1, w = box.clientWidth, h = box.clientHeight;
+  if (trackCanvas.width !== Math.round(w * dpr) || trackCanvas.height !== Math.round(h * dpr)) { trackCanvas.width = Math.round(w * dpr); trackCanvas.height = Math.round(h * dpr); }
+  const g = trackCanvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const px = (f) => { try { const p = aladin.world2pix(f.ra_obj, f.dec_obj); return p && isFinite(p[0]) && isFinite(p[1]) ? p : null; } catch (_) { return null; } };
+  const curEpoch = S.seq[S.idx]?.epoch;
+  g.lineCap = "round"; g.lineJoin = "round"; g.textBaseline = "middle";
+  for (const v of trackVisits()) {
+    const cur = v.epoch === curEpoch, pts = v.pts.map(px).filter(Boolean);
+    if (!pts.length) continue;
+    const col = cur ? "255,158,61" : "170,196,235";  // the visit being shown in the accent colour, the rest quiet
+    // soft glow under a thin line
+    g.shadowColor = `rgba(${col},${cur ? 0.9 : 0.45})`; g.shadowBlur = cur ? 10 : 5;
+    g.strokeStyle = `rgba(${col},${cur ? 1 : 0.6})`; g.lineWidth = cur ? 2.4 : 1.4;
+    g.beginPath();
+    pts.forEach((p, i) => (i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1])));
+    if (pts.length === 1) g.lineTo(pts[0][0] + 0.01, pts[0][1]);
+    g.stroke();
+    // arrow head at the end of the visit: which way it was going
+    const a = pts[pts.length - 1], b = [...pts].reverse().find((p) => Math.hypot(p[0] - a[0], p[1] - a[1]) > 3);
+    if (b) {
+      const ang = Math.atan2(a[1] - b[1], a[0] - b[0]), s = cur ? 7 : 5;
+      g.beginPath();
+      g.moveTo(a[0] + Math.cos(ang) * s, a[1] + Math.sin(ang) * s);
+      g.lineTo(a[0] + Math.cos(ang + 2.5) * s, a[1] + Math.sin(ang + 2.5) * s);
+      g.lineTo(a[0] + Math.cos(ang - 2.5) * s, a[1] + Math.sin(ang - 2.5) * s);
+      g.closePath(); g.fillStyle = `rgba(${col},${cur ? 1 : 0.7})`; g.fill();
+    }
+    g.shadowBlur = 0;
+    // start of the visit: a small open dot and its date
+    const s0 = pts[0];
+    g.beginPath(); g.arc(s0[0], s0[1], cur ? 3.5 : 2.5, 0, 2 * Math.PI);
+    g.fillStyle = "#090c12"; g.fill(); g.lineWidth = 1.5; g.strokeStyle = `rgba(${col},${cur ? 1 : 0.75})`; g.stroke();
+    g.font = `${cur ? 600 : 500} ${cur ? 12 : 11}px system-ui, sans-serif`;
+    const tw = g.measureText(v.label).width, tx = s0[0] + 9 + tw > w ? s0[0] - 9 - tw : s0[0] + 9, ty = Math.min(h - 10, Math.max(10, s0[1] - 11));
+    g.lineWidth = 3; g.strokeStyle = "rgba(0,0,0,.8)"; g.strokeText(v.label, tx, ty);
+    g.fillStyle = `rgba(${col},${cur ? 1 : 0.8})`; g.fillText(v.label, tx, ty);
+  }
+  // where the object is in the frame on screen: a bright dot with a halo
+  const now = trackNow(), p = now && px(now);
+  if (p) {
+    g.beginPath(); g.arc(p[0], p[1], 10, 0, 2 * Math.PI); g.fillStyle = "rgba(255,158,61,.18)"; g.fill();
+    g.shadowColor = "rgba(255,158,61,.95)"; g.shadowBlur = 12;
+    g.beginPath(); g.arc(p[0], p[1], 4.5, 0, 2 * Math.PI); g.fillStyle = "#ff9e3d"; g.fill();
+    g.shadowBlur = 0;
+    g.beginPath(); g.arc(p[0], p[1], 1.8, 0, 2 * Math.PI); g.fillStyle = "#fff"; g.fill();
+  }
 }
 
 // Drag (or arrow keys on) the grip under the panel to change its height. Aladin watches its div
@@ -1191,6 +1378,8 @@ function updateURL() {
   if (skyLayer === "sx") p.set("sky", `sx${SX_FRAMES[+$("#sxframe").value]}`);
   if (S.embed) p.set("embed", "1");
   history.replaceState(null, "", `?${p}`);
+  p.delete("embed");
+  $("#openfull").href = `${location.pathname}?${p}`;
 }
 
 // ------------------------------------------------------------------ playback + events
@@ -1222,7 +1411,7 @@ function wire() {
   $("#slider").oninput = (e) => { S.idx = +e.target.value; S.playing = false; $("#play").textContent = "▶"; render(); };
   $("#speed").oninput = (e) => (S.speed = +e.target.value);
   $("#contrast").oninput = () => { computeLimits(); render(); };
-  for (const id of ["#stretch", "#invert", "#ov-gaia", "#ov-names", "#ov-target", "#ov-ap"]) $(id).onchange = render;
+  for (const id of ["#stretch", "#invert", "#ov-gaia", "#ov-wise", "#ov-names", "#ov-target", "#ov-ap"]) $(id).onchange = render;
   $("#track").onchange = () => { computePhotometry(); drawPlots(); buildTable(); render(); };
   $("#aprad").onchange = (e) => { APER.r = +e.target.value; APER.r1 = APER.r + 2; APER.r2 = APER.r + 5; computePhotometry(); drawPlots(); buildTable(); render(); };
   $("#hideflag").onchange = drawPlots;
@@ -1306,7 +1495,7 @@ function wire() {
   $("#copylink").onclick =() => copy(location.href.replace(/[?&]embed=1/, ""), "#copylink");
   $("#copyembed").onclick = () => {
     const u = new URL(location.href); u.searchParams.set("embed", "1");
-    copy(`<iframe src="${u}" width="560" height="760" style="border:0" title="SPHEREx Motion Viewer"></iframe>`, "#copyembed");
+    copy(`<iframe src="${u}" width="560" height="920" style="border:0" title="SPHEREx Motion Viewer"></iframe>`, "#copyembed");
   };
   $("#ftable tbody").addEventListener("click", (e) => {
     const tr = e.target.closest("tr"); if (!tr || e.target.tagName === "A") return;
@@ -1325,7 +1514,14 @@ function copy(text, btn) {
 
 // ------------------------------------------------------------------ boot
 wire();
+// Say which SPHEREx releases are being searched: the server finds them itself as NASA publishes them.
+api("/api/releases").then((r) => {
+  if (!r.releases?.length) return;
+  $("#releases").textContent = `SPHEREx data releases searched: ${r.releases.join(", ")}, wide and deep surveys. ` +
+    `Found automatically from ${r.source}${r.checked ? ` (checked ${r.checked})` : ""}; a new release is picked up without changing the tool.`;
+}).catch(() => { });
 requestAnimationFrame(tick);
+requestAnimationFrame(paintSkyTrack);
 (() => {
   const p = new URLSearchParams(location.search);
   const sky = /^sx(\d+)?$/.exec(p.get("sky") || "");

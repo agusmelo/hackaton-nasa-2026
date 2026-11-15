@@ -9,6 +9,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -22,9 +23,9 @@ from astropy.wcs import WCS
 from fitsrange import RemoteSpherexImage
 
 SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
-# Newest releases first; each collection is queried and results merged (dedup by obs id + detector).
-# Add new releases here as IRSA publishes them (e.g. "spherex_qr4").
-COLLECTIONS = [c.strip() for c in os.environ.get("SPHEREX_COLLECTIONS", "spherex_dr1,spherex_qr3").split(",") if c.strip()]
+# Used only if the release list cannot be discovered (see collections()).
+FALLBACK_COLLECTIONS = ["spherex_dr1", "spherex_dr1_deep", "spherex_qr3", "spherex_qr3_deep"]
+BUCKET_LIST_URL = "https://nasa-irsa-spherex.s3.us-east-1.amazonaws.com/?list-type=2&delimiter=/"
 PIXSCALE = 6.15  # arcsec / native SPHEREx pixel
 CACHE = Path(os.environ.get("SPHEREX_CACHE", Path(__file__).parent / "cache"))
 CACHE.mkdir(exist_ok=True)
@@ -93,23 +94,105 @@ def propagate(ra, dec, pmra, pmdec, epoch_from: float, epoch_to: float):
 
 
 # ---------------------------------------------------------------- image search
-def search_images(ra: float, dec: float) -> list[dict]:
-    ck = CACHE / f"sia_{_key(round(ra, 4), round(dec, 4), *COLLECTIONS)}.json"
-    if ck.exists() and time.time() - ck.stat().st_mtime < 6 * 3600:
+def releases() -> dict:
+    """Which SPHEREx data releases to search, found without editing this file when a new one comes out.
+
+    NASA's public bucket holds one folder per release ("dr1/", "qr3/", ...). Every Data Release is used,
+    plus the newest Quick Release (older Quick Releases are superseded). Each release has a wide-survey
+    and a deep-field image collection at IRSA. SPHEREX_COLLECTIONS (comma-separated) overrides all this.
+    """
+    env = [c.strip() for c in os.environ.get("SPHEREX_COLLECTIONS", "").split(",") if c.strip()]
+    if env:
+        return {"collections": env, "releases": [], "source": "SPHEREX_COLLECTIONS"}
+    ck = CACHE / "releases.json"
+    if ck.exists() and time.time() - ck.stat().st_mtime < 12 * 3600:
         return json.loads(ck.read_text())
-    seen, out = set(), []
-    for coll in COLLECTIONS:
-        last = None
-        for attempt in range(4):
+    try:
+        r = requests.get(BUCKET_LIST_URL, timeout=20, headers=UA)
+        r.raise_for_status()
+        found = sorted({(k, int(n)) for k, n in re.findall(r"<Prefix>(dr|qr)(\d+)/</Prefix>", r.text)})
+        drs = sorted((n for k, n in found if k == "dr"), reverse=True)
+        qrs = sorted((n for k, n in found if k == "qr"), reverse=True)
+        rel = [f"dr{n}" for n in drs] + ([f"qr{qrs[0]}"] if qrs else [])  # Data Releases first: preferred on duplicates
+        if not rel:
+            raise ValueError("no release folders found")
+        out = {"collections": [c for x in rel for c in (f"spherex_{x}", f"spherex_{x}_deep")],
+               "releases": [x.upper() for x in rel], "source": "NASA S3 bucket listing",
+               "checked": Time.now().strftime("%Y-%m-%d %H:%M UTC")}
+        ck.write_text(json.dumps(out))
+        return out
+    except Exception:
+        if ck.exists():  # stale but real
+            return json.loads(ck.read_text())
+        return {"collections": FALLBACK_COLLECTIONS, "releases": ["DR1", "QR3"], "source": "built-in list"}
+
+
+def collections() -> list[str]:
+    return releases()["collections"]
+
+
+def _sia_rows(coll: str, ra: float, dec: float):
+    """Rows of one collection, or an Exception (returned, not raised, so one failure does not sink the rest)."""
+    last = None
+    for attempt in range(3):
+        try:
             r = requests.get(SIA_URL, params={"COLLECTION": coll, "POS": f"circle {ra} {dec} 0.0005"},
                              timeout=180, headers=UA)
             if r.ok and r.content.lstrip().startswith(b"<?xml"):
-                break
-            last = r.status_code
-            time.sleep(1.5 * (attempt + 1))
-        else:
-            raise IOError(f"IRSA SIA query failed for {coll} (HTTP {last}); IRSA may be busy, retry shortly")
-        tab = parse_single_table(io.BytesIO(r.content)).to_table(use_names_over_ids=True)
+                return parse_single_table(io.BytesIO(r.content)).to_table(use_names_over_ids=True)
+            last = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            last = type(e).__name__
+        except Exception as e:  # an answer that is not a table
+            last = type(e).__name__
+        time.sleep(1.0 + attempt)
+    return IOError(last or "no answer")
+
+
+def _saved_image_list(ra: float, dec: float):
+    """The image list saved for this position on an earlier search, if any: (frames, saved-when, partial)."""
+    names = [("all",), tuple(collections()), ("spherex_dr1", "spherex_qr3")]  # current key, then the two older ones
+    for extra in names:
+        f = CACHE / f"sia_{_key(round(ra, 4), round(dec, 4), *extra)}.json"
+        if not f.exists():
+            continue
+        try:
+            d = json.loads(f.read_text())
+        except ValueError:
+            continue
+        frames = d["frames"] if isinstance(d, dict) else d
+        if frames:
+            return frames, f.stat().st_mtime, bool(isinstance(d, dict) and d.get("partial"))
+    return None
+
+
+def search_images_ex(ra: float, dec: float) -> dict:
+    """Every SPHEREx Level-2 image covering a position: {"frames": [...], "notice": str | None}.
+
+    IRSA's image search has outages (HTTP 502) and slow spells. A list saved less than a day ago is
+    used as is. Otherwise IRSA is asked; collections that fail are reported, and if none answers the
+    saved list is used whatever its age, so a position that was loaded once keeps working.
+    """
+    saved = _saved_image_list(ra, dec)
+    if saved and not saved[2] and time.time() - saved[1] < 24 * 3600:
+        return {"frames": saved[0], "notice": None}
+    colls = collections()
+    # one query per collection, side by side: IRSA can take 20 s for each
+    with ThreadPoolExecutor(max_workers=len(colls)) as ex:
+        tables = list(ex.map(lambda c: _sia_rows(c, ra, dec), colls))
+    failed = [c for c, t in zip(colls, tables) if isinstance(t, Exception)]
+    why = next((str(t) for t in tables if isinstance(t, Exception)), "")
+    when = Time(saved[1], format="unix").strftime("%Y-%m-%d") if saved else None
+    if len(failed) == len(colls):
+        if saved:
+            return {"frames": saved[0], "notice": f"IRSA's image search is not answering ({why}). Showing the image list "
+                    f"saved on {when}; exposures published since then are missing."}
+        raise IOError(f"IRSA's image search is not answering ({why}) and this position has not been loaded here before, "
+                      "so there is no saved image list to fall back on. Positions loaded earlier still work. Try again in a few minutes.")
+    seen, out = set(), []
+    for coll, tab in zip(colls, tables):
+        if isinstance(tab, Exception):
+            continue
         for row in tab:
             if str(row["dataproduct_subtype"]) != "science":
                 continue
@@ -126,9 +209,24 @@ def search_images(ra: float, dec: float) -> list[dict]:
                 "exptime": float(row["t_exptime"]),
                 "em_min_um": float(row["em_min"]) * 1e6, "em_max_um": float(row["em_max"]) * 1e6,
             })
+    notice = None
+    if failed:
+        # keep what the collections that did not answer contributed last time
+        kept = 0
+        for f in (saved[0] if saved else []):
+            if f["id"] not in seen and f.get("collection") in failed:
+                seen.add(f["id"]); out.append(f); kept += 1
+        names = ", ".join(c.replace("spherex_", "").upper() for c in failed)
+        notice = (f"IRSA did not answer for {names} ({why}). " +
+                  (f"Their {kept} exposures come from the list saved on {when}." if kept
+                   else "Exposures from those releases are missing; reload in a few minutes to try again."))
     out.sort(key=lambda d: d["mjd"])
-    ck.write_text(json.dumps(out))
-    return out
+    (CACHE / f"sia_{_key(round(ra, 4), round(dec, 4), 'all')}.json").write_text(json.dumps({"frames": out, "partial": bool(failed)}))
+    return {"frames": out, "notice": notice}
+
+
+def search_images(ra: float, dec: float) -> list[dict]:
+    return search_images_ex(ra, dec)["frames"]
 
 
 def group_epochs(frames: list[dict], gap_days: float = 7.0) -> list[dict]:
@@ -310,6 +408,45 @@ ORDER BY phot_g_mean_mag"""
                     "pmdec": f("pmdec") or 0.0, "plx": f("parallax"), "plx_err": f("parallax_error"),
                     "g": f("phot_g_mean_mag"), "bp_rp": f("bp_rp"), "teff": f("teff_gspphot"),
                     "rv": f("radial_velocity"), "variable": v.get("phot_variable_flag", "").strip('"') == "VARIABLE"})
+    ck.write_text(json.dumps(out))
+    return out
+
+
+# ---------------------------------------------------------------- WISE sources (CatWISE2020, IRSA)
+GATOR_URL = "https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query"
+
+
+def wise_sources(ra: float, dec: float, radius_deg: float) -> list[dict]:
+    """CatWISE2020 sources around a position: W1 (3.4 um) and W2 (4.6 um) magnitudes and proper motion.
+
+    CatWISE is the WISE catalogue with motions, so its sources can be placed at each frame's date like
+    Gaia's. A red W1-W2 colour with no Gaia counterpart is what a cold brown dwarf looks like.
+    """
+    ck = CACHE / f"wise_{_key(round(ra, 4), round(dec, 4), round(radius_deg, 4))}.json"
+    if ck.exists():
+        return json.loads(ck.read_text())
+    r = requests.get(GATOR_URL, timeout=(10, 90), headers=UA, params={
+        "catalog": "catwise_2020", "spatial": "cone", "radius": round(min(radius_deg, 0.3) * 3600), "radunits": "arcsec",
+        "objstr": f"{ra} {dec}", "outfmt": 1, "selcols": "source_name,ra,dec,w1mpro,w2mpro,pmra,pmdec,meanobsmjd"})
+    r.raise_for_status()
+    lines = r.text.splitlines()
+    head = next((ln for ln in lines if ln.startswith("|")), None)
+    if head is None:
+        raise IOError("unexpected answer from IRSA's catalogue service")
+    cuts = [i for i, ch in enumerate(head) if ch == "|"]
+    cols = [c.strip() for c in head.strip("|").split("|")]
+    out = []
+    for ln in lines:
+        if not ln or ln[0] in "\\|":
+            continue
+        v = {c: ln[a + 1:b + 1].strip() for c, (a, b) in zip(cols, zip(cuts[:-1], cuts[1:]))}
+        f = lambda k: float(v[k]) if v.get(k) not in (None, "", "null") else None
+        if f("ra") is None or f("dec") is None:
+            continue
+        mjd = f("meanobsmjd")
+        out.append({"id": v.get("source_name"), "ra": f("ra"), "dec": f("dec"), "w1": f("w1mpro"), "w2": f("w2mpro"),
+                    "pmra": (f("pmra") or 0.0) * 1000, "pmdec": (f("pmdec") or 0.0) * 1000,  # arcsec/yr -> mas/yr
+                    "epoch": 2000.0 + (mjd - 51544.5) / 365.25 if mjd else 2015.4})
     ck.write_text(json.dumps(out))
     return out
 

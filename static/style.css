@@ -101,6 +101,7 @@ main { display: grid; grid-template-columns: minmax(0, 680px) minmax(0, 1fr); ga
 .fact.warn b { color: var(--warn); }
 .tnote { margin: 6px 0 0; }
 .tnote:empty { display: none; }
+.tnote.warn { color: var(--warn); background: rgba(232, 217, 138, .08); border-left: 3px solid var(--warn); border-radius: 0 6px 6px 0; padding: 6px 10px; }
 
 /* ---------- the player */
 .canvaswrap { position: relative; width: 100%; aspect-ratio: 1; background: #000; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line2); box-shadow: 0 10px 30px rgba(0, 0, 0, .35); }
@@ -181,10 +182,18 @@ body.sky-full { overflow: hidden; }
 .skylegend span { display: inline-flex; align-items: center; gap: 6px; }
 .skylegend .box { width: 12px; height: 12px; border: 2px solid var(--c); border-radius: 2px; }
 .skylegend .box.dashed { border-style: dashed; }
-.skylegend .track { width: 18px; height: 3px; border-radius: 2px; background: linear-gradient(90deg, #59c2ff 0 33%, #ff9e3d 33% 66%, #7bd88f 66%); }
+.skylegend .track { width: 20px; height: 2px; border-radius: 2px; background: var(--accent); box-shadow: 0 0 6px rgba(255, 158, 61, .8); }
+.skylegend .nowdot { width: 9px; height: 9px; border-radius: 50%; background: radial-gradient(#fff 0 22%, var(--accent) 26%); box-shadow: 0 0 0 4px rgba(255, 158, 61, .18); margin: 0 3px; }
+/* our own drawing of a solar-system object's path, laid over Aladin */
+#skytrack { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
+/* Aladin's centre reticle is not the object: hide it while following one */
+body.is-moving #aladin .aladin-reticle { display: none !important; }
 /* some marks and legend entries only make sense for one kind of target */
 body.is-moving .only-sky, body:not(.is-moving) .only-moving { display: none; }
 
+.swatch.diamond { width: 10px; height: 10px; border: 2px solid var(--c); transform: rotate(45deg); margin: 0 2px; }
+footer .rel { margin-top: 8px; }
+footer .rel:empty { display: none; }
 .swatch.tag { width: auto; height: auto; font-size: 11px; font-weight: 700; color: var(--accent2); line-height: 1; }
 
 /* who the measured object is */
@@ -225,6 +234,10 @@ footer .ack { margin-top: 8px; }
 /* ---------- embedded in another page: just the player */
 body.embed header, body.embed footer, body.embed .side, body.embed .tablecard, body.embed .welcome, body.embed .controls fieldset:nth-child(n+2) { display: none; }
 body.embed main { grid-template-columns: 1fr; padding: 8px; }
+/* inside someone else's page: a way out to the whole tool, not buttons for sharing the embed */
+.openfull { display: none; white-space: nowrap; font-size: 13px; }
+body.embed .links button { display: none; }
+body.embed .openfull { display: inline-block; }
 
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }

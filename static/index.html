@@ -34,12 +34,13 @@
         <option value="moving">Asteroid / comet</option>
       </select>
       <input id="q" aria-label="Target" placeholder="Object name or RA Dec (e.g. 08h55m10.8s -07d14m42s)" autocomplete="off">
-      <label class="fov" title="Field of view of the player">Field
+      <label class="fov" title="Field of view of the player. A larger field can follow faster movers, but every exposure is a bigger download: 15′ transfers about 9 times as much as 5′">Field
         <select id="fov">
           <option value="2.5">2.5′</option>
           <option value="5" selected>5′</option>
           <option value="8">8′</option>
           <option value="12">12′</option>
+          <option value="15">15′</option>
         </select>
       </label>
     </div>
@@ -77,6 +78,7 @@
       <div class="links">
         <button id="copylink" class="ghost">Copy link</button>
         <button id="copyembed" class="ghost">Embed</button>
+        <a id="openfull" class="openfull" target="_blank" rel="noopener">Open full viewer ↗</a>
       </div>
     </div>
     <div class="canvaswrap">
@@ -104,6 +106,8 @@
           <button data-v="epoch" class="on" title="Median-stack all selected exposures per epoch, then blink between epochs">Epoch blink</button>
           <button data-v="rgb" title="Colour image per epoch: blue = 0.75–1.6 µm, green = 1.6–3.8 µm, red = 3.8–5 µm. Cold objects such as brown dwarfs look red">Colour</button>
           <button data-v="diff" title="Each epoch minus the median of the other epochs: movers show as black/white pairs">Difference</button>
+          <button data-v="sum" title="Add every epoch together into one deeper image: fixed sources get sharper, anything that moved smears out">Sum</button>
+          <button data-v="bands" title="One deep image per detector, all epochs added, played from 0.75 to 5 µm: watch how each source changes with wavelength">Bands</button>
           <button data-v="exp" title="Every exposure in time order (each at its own wavelength)">Exposures</button>
         </div>
         <div class="row">
@@ -125,6 +129,7 @@
           <label><input type="checkbox" id="ov-target" checked><span class="swatch cross" style="--c:#ff4fd8"></span> Target prediction</label>
           <label><input type="checkbox" id="ov-ap" checked><span class="swatch ring" style="--c:#7bd88f"></span> Measurement circle</label>
           <label class="only-sky"><input type="checkbox" id="ov-gaia" checked><span class="swatch ring" style="--c:#59c2ff"></span> Gaia DR3 stars, at the frame's date</label>
+          <label class="only-sky" title="Infrared sources from the WISE mission (CatWISE2020 catalogue) that Gaia does not list, placed at the frame's date. Red diamonds are bright and red in WISE: the colour of a cool brown dwarf, or of a dusty galaxy."><input type="checkbox" id="ov-wise"><span class="swatch diamond" style="--c:#ff7ab8"></span> WISE sources not in Gaia</label>
           <label class="only-sky" title="Names of the objects SIMBAD knows in this field, and of fast-moving stars. Hover any mark for its details."><input type="checkbox" id="ov-names" checked><span class="swatch tag">Aa</span> Names</label>
         </div>
       </fieldset>
@@ -153,7 +158,8 @@
       <div class="skylegend">
         <span class="only-sky"><i class="box" style="--c:#ff9e3d"></i>Field loaded</span>
         <span class="only-sky"><i class="box" style="--c:#7bd88f"></i>Player view when zoomed</span>
-        <span class="only-moving"><i class="track"></i>Path of the object, one colour per visit</span>
+        <span class="only-moving"><i class="track"></i>Path of the object in each visit; the one on screen is highlighted</span>
+        <span class="only-moving"><i class="nowdot"></i>Where it is in the frame shown</span>
         <span><i class="box dashed" style="--c:#59c2ff"></i>Field to load</span>
       </div>
     </div>
@@ -193,6 +199,7 @@
   <p>Data: NASA SPHEREx via <a href="https://irsa.ipac.caltech.edu/Missions/spherex.html" target="_blank" rel="noopener">IRSA</a> ·
   solar-system object positions via IRSA's Moving Object Search Tool (JPL Horizons orbits) ·
   Gaia DR3 (ESA) via STScI/MAST · names and object types via SIMBAD and CDS Sesame · context via Aladin Lite (CDS). Prototype for the NASA Space Apps 2026 "Planet X and SPHEREx" challenge.</p>
+  <p class="rel" id="releases"></p>
   <p class="ack">This publication makes use of data products from the Spectro-Photometer for the History of the Universe, Epoch of Reionization and Ices Explorer (SPHEREx), which is a joint project of the Jet Propulsion Laboratory and the California Institute of Technology, and is funded by the National Aeronautics and Space Administration.</p>
 </footer>
 <script src="/static/app.js"></script>
