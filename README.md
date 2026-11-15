@@ -56,3 +56,16 @@ Optional: `python warm_cache.py` pre-fetches the five challenge targets so a liv
 * Difference images still leave residuals on the brightest field stars, where saturated cores are masked differently in each epoch. Positions themselves agree with Gaia to about 0.05 px between epochs.
 * Bilinear resampling slightly smooths the images. Drizzle or ePSF-aware resampling would sharpen motion detection.
 * Possible additions: a moving-object (asteroid) mode that compares exposures within the same day, and clicking a frame to open it in an external FITS viewer.
+
+## License
+
+The code in this repository is released under the [MIT License](LICENSE).
+
+Two third-party libraries are bundled unmodified in `static/vendor/` and keep their own licenses, which the MIT license above does not cover:
+
+| File | Library | License |
+|---|---|---|
+| `static/vendor/plotly.min.js` | plotly.js 2.35.2 | MIT |
+| `static/vendor/aladin.js` | Aladin Lite 3.8.2 (CDS, Strasbourg) | GPL-3.0 |
+
+Data: NASA SPHEREx via IRSA, Gaia DR3 (ESA), object names via CDS Sesame.
